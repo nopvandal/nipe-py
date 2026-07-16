@@ -20,11 +20,15 @@ import time
 import urllib.request
 
 # --- Configuration ----------------------------------------------------------
-# 9040 is tor's conventional TransPort. Upstream nipe uses 9051, which is tor's
-# conventional ControlPort -- safe only because it never enables one.
+# tor defaults both of these to 0 and prescribes no number; 9040/5353 are just
+# what the transparent-proxy guides settled on. 9040 is uncontested, so we take
+# it. Upstream nipe uses 9051, which those guides also avoid: it's the usual
+# ControlPort, safe for upstream only because it never enables one.
 TRANS_PORT = "9040"          # Tor transparent-proxy port (all TCP funnels here)
-DNS_PORT = "9061"            # Tor DNS port (all :53 lookups funnel here); tor's
-                             # conventional 5353 would collide with mDNS/Avahi.
+# 9061 is upstream's arbitrary pick, kept because it's unclaimed. Don't "correct"
+# it to the guides' 5353 -- that's IANA-registered mDNS, and any desktop running
+# Avahi already holds it.
+DNS_PORT = "9061"            # Tor DNS port (all :53 lookups funnel here)
 VIRT_NET_V4 = "10.66.0.0/255.255.0.0"   # AutomapHostsOnResolve range (.onion)
 VIRT_NET_V6 = "fd00::/8"
 # Dedicated data dir so we never collide with the system tor's DataDirectory lock.
