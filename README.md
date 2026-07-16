@@ -2,19 +2,18 @@
 
 Route all your traffic through the [Tor](https://www.torproject.org/) network.
 
-This is a dependency-free (Python stdlib-only) reimplementation of
-[htrgouvea/nipe](https://github.com/htrgouvea/nipe). It runs a private Tor
-instance with a transparent proxy (`TransPort`) and a DNS resolver (`DNSPort`),
-then installs `iptables` OUTPUT rules that send all outbound TCP through Tor and
-all DNS through Tor's resolver. The tor daemon itself and local/LAN destinations
-are exempt. Stray UDP and ICMP get rejected so nothing leaks.
+A Python rewrite of [htrgouvea/nipe](https://github.com/htrgouvea/nipe) with no
+dependencies beyond the standard library. It starts a private Tor instance and
+adds `iptables` rules that push all outbound TCP and DNS through it. Local and
+LAN traffic is left alone, and anything that can't be routed through Tor is
+rejected rather than sent in the clear.
 
 ## Requirements
 
 - Linux with `iptables` (and `ip6tables` for IPv6)
 - `tor`
-- Python 3 (standard library only, no `pip install` needed)
-- root privileges
+- Python 3
+- root
 
 ## Usage
 
@@ -40,16 +39,12 @@ $ sudo ./nipe.py start
 [+] Ip: <a Tor exit-node IP>
 ```
 
-## How it works
+## Notes
 
-- A dedicated data directory (`/var/lib/nipe-tor`) keeps this instance from
-  colliding with the system Tor's `DataDirectory` lock.
-- In the `nat` table, DNS (`:53`) is redirected to Tor's `DNSPort` and all other
-  TCP is redirected to Tor's `TransPort`. The mirrored `filter` table accepts the
-  same traffic so it isn't dropped later.
-- Established connections, Tor's own UID, and local/RFC1918/ULA/link-local
-  destinations bypass Tor.
-- Everything else that isn't Tor-bound UDP or ICMP is rejected.
+The Tor config is generated at `/run/nipe-torrc` on every start, so edits to it
+won't survive. Change the constants at the top of `nipe.py` instead. The
+instance uses its own data directory (`/var/lib/nipe-tor`) and no SOCKS port, so
+it can run alongside a system Tor.
 
 ## Credits
 

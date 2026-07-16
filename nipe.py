@@ -115,6 +115,8 @@ def has_ipv6():
 
 # --- Tor process ------------------------------------------------------------
 def write_torrc(uid):
+    # SOCKSPort 0: we only transparent-proxy, and tor's implicit default (9050)
+    # would fail to bind when the system tor already holds it, killing startup.
     with open(TORRC, "w") as f:
         f.write(f"""\
 DataDirectory {DATA_DIR}
@@ -123,6 +125,7 @@ RunAsDaemon 1
 User {uid}
 Log notice file {LOG_FILE}
 ClientOnly 1
+SOCKSPort 0
 TransPort {TRANS_PORT}
 DNSPort {DNS_PORT}
 VirtualAddrNetwork {VIRT_NET_V4}
