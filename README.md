@@ -8,6 +8,8 @@ adds `iptables` rules that push all outbound TCP and DNS through it. Local and
 LAN traffic is left alone, and anything that cannot be routed through Tor is
 rejected rather than sent in the clear.
 
+**Linux only.** See [Portability](#portability).
+
 ## Requirements
 
 - Linux with `iptables` (and `ip6tables` if IPv6 is enabled)
@@ -66,6 +68,27 @@ knowing about.
 - **IPv6 is all or nothing.** If IPv6 is enabled but `ip6tables` is missing,
   `start` refuses to run rather than leave IPv6 unfiltered, since glibc prefers
   AAAA and most traffic would leak.
+
+## Portability
+
+This runs on Linux and nowhere else. It does not work on macOS, and it does not
+work on the BSDs. The dependencies are structural, not incidental:
+
+- `iptables`, `ip6tables` and `iptables-restore`, which have no equivalent
+  outside Linux.
+- `/proc/<pid>/comm` to confirm the pidfile still points at our Tor, and
+  `/proc/sys/net/ipv6/conf/all/disable_ipv6` to detect IPv6.
+- `/run` for the generated torrc, `conntrack` for the state flush, and
+  `resolvectl` or `nscd` for the DNS flush.
+- An unprivileged `debian-tor`, `toranon` or `tor` account for Tor to drop to,
+  and a distro package manager for `install`.
+
+Porting to macOS is more than swapping those out. The rule set redirects this
+host's own outbound packets, and `pf` applies `rdr` only to traffic arriving on
+an interface, so there is no counterpart to the `nat` `OUTPUT` chain. Getting
+locally originated traffic into a transparent proxy on macOS means `route-to` on
+the outbound rules or a `utun` with policy routing, neither of which is a
+translation of what is here. Upstream Nipe is Linux-only for the same reason.
 
 ## Notes
 
