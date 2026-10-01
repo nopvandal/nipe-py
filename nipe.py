@@ -166,13 +166,36 @@ def require_root() -> None:
 
 
 # --- Firewall ---------------------------------------------------------------
-def ipv6_enabled() -> bool:
-    """Report whether the kernel currently has IPv6 turned on."""
+def ipv6_supported() -> bool:
+    """Report whether the kernel can carry IPv6 at all.
+
+    net.ipv6.conf.all.disable_ipv6 is not a master switch: it only records the
+    last value written to "all". NetworkManager re-enables IPv6 per interface,
+    and interfaces created later take conf/default instead, so a host reading 1
+    there can still have live IPv6 addresses. The only state in which IPv6
+    cannot leak is a kernel without it (ipv6.disable=1 or no module), where
+    /proc/sys/net/ipv6 does not exist.
+    """
+    return Path("/proc/sys/net/ipv6").exists()
+
+
+def loopback_has_ipv6() -> bool:
+    """Report whether ::1 is configured on lo, so tor can listen on it.
+
+    IPv6 can be supported yet disabled on lo alone; tor treats a failed bind
+    as fatal, so [::1] listeners may only be configured when the address
+    exists. /proc/net/if_inet6 lists one address per line as 32 hex digits,
+    ifindex, prefix length, scope, flags and the interface name.
+    """
     try:
-        disabled = Path("/proc/sys/net/ipv6/conf/all/disable_ipv6").read_text()
+        lines = Path("/proc/net/if_inet6").read_text().splitlines()
     except OSError:
         return False
-    return disabled.strip() == "0"
+    for line in lines:
+        fields = line.split()
+        if len(fields) == 6 and fields[0] == "0" * 31 + "1" and fields[5] == "lo":
+            return True
+    return False
 
 
 def _families() -> list[Family]:
@@ -183,14 +206,14 @@ def _families() -> list[Family]:
     clear while the IPv4 path looked healthy.
     """
     families = [V4]
-    if not ipv6_enabled():
+    if not ipv6_supported():
         return families
     for binary in (V6.iptables, V6.restore):
         if shutil.which(binary) is None:
             raise NipeError(
-                f"IPv6 is enabled but {binary} is missing, so IPv6 traffic would "
-                "leak in the clear. Install it, or disable IPv6 with "
-                "'sysctl -w net.ipv6.conf.all.disable_ipv6=1'."
+                f"the kernel supports IPv6 but {binary} is missing, so IPv6 "
+                "traffic would leak in the clear. Install it, or boot with the "
+                "ipv6.disable=1 kernel parameter."
             )
     families.append(V6)
     return families
@@ -212,9 +235,11 @@ def _ruleset(family: Family, user: str) -> str:
             f"--to-ports {TRANS_PORT}"
         ),
         # UDP DNS -> tor's resolver, including queries aimed at a loopback or LAN
-        # resolver, which is why this precedes the exemptions below. TCP DNS is
-        # deliberately left to the TransPort catch-all: tor's DNSPort has no TCP
-        # listener, so redirecting it here would only produce ECONNREFUSED.
+        # resolver, which is why this precedes the exemptions below. tor's
+        # DNSPort has no TCP listener, so TCP DNS is not redirected here: to a
+        # public resolver it falls through to the TransPort catch-all, and to an
+        # on-link resolver it would hit the local-network RETURN, so NIPE_OUT
+        # rejects it instead.
         f"-A {NAT_CHAIN} -p udp --dport 53 -j REDIRECT --to-ports {DNS_PORT}",
     ]
     nat += [f"-A {NAT_CHAIN} -d {net} -j RETURN" for net in family.local_nets]
@@ -224,6 +249,10 @@ def _ruleset(family: Family, user: str) -> str:
         # Redirected traffic has already been rewritten to the loopback address.
         f"-A {OUT_CHAIN} -o lo -j RETURN",
         f"-A {OUT_CHAIN} -m owner --uid-owner {user} -j RETURN",
+        # TCP DNS to a LAN resolver would otherwise match the local-network
+        # exemptions and go out in the clear. A loopback stub (127.0.0.53) is
+        # still reachable over lo above; only its TCP upstream fails, closed.
+        f"-A {OUT_CHAIN} -p tcp --dport 53 -j REJECT",
     ]
     out += [f"-A {OUT_CHAIN} -d {net} -j RETURN" for net in family.local_nets]
     # Default deny, with no protocol qualifier: ESP, GRE, SCTP, DCCP, IPIP and
@@ -268,9 +297,10 @@ def _teardown(family: Family) -> None:
     for table, parent, chain in _jumps():
         base = [ipt, "-w", XT_LOCK_WAIT, "-t", table]
         # A jump can appear more than once if a previous run was interrupted.
-        for _ in range(8):
-            if run([*base, "-D", parent, "-j", chain]).returncode != 0:
-                break
+        # Remove them all, or -X fails and every run adds another; each
+        # successful -D deletes exactly one rule, so this loop terminates.
+        while run([*base, "-D", parent, "-j", chain]).returncode == 0:
+            pass
         run([*base, "-F", chain])
         run([*base, "-X", chain])
 
@@ -298,9 +328,20 @@ def teardown_all() -> None:
 
 
 def rules_installed() -> bool:
-    """Report whether nipe's IPv4 chains are currently live."""
-    cmd = ["iptables", "-w", XT_LOCK_WAIT, "-t", "nat", "-n", "-L", NAT_CHAIN]
-    return run(cmd).returncode == 0
+    """Report whether every nipe jump is live for every family that needs one.
+
+    A chain that exists but is no longer jumped to (an interrupted start, or a
+    host firewall reload that rebuilt OUTPUT) filters nothing, so each jump is
+    checked with -C. IPv6 is required whenever the kernel supports it, as in
+    _families(); a missing ip6tables makes run() fail, reporting not installed.
+    """
+    families = [V4, V6] if ipv6_supported() else [V4]
+    for family in families:
+        for table, parent, chain in _jumps():
+            base = [family.iptables, "-w", XT_LOCK_WAIT, "-t", table]
+            if run([*base, "-C", parent, "-j", chain]).returncode != 0:
+                return False
+    return True
 
 
 def flush_conntrack() -> None:
@@ -328,15 +369,17 @@ def flush_dns_cache() -> None:
 
 
 # --- Tor process ------------------------------------------------------------
-def write_torrc(user: str, ipv6: bool) -> None:
+def write_torrc(user: str, loopback_v6: bool) -> None:
     """Generate the private tor configuration for this run."""
     listeners = [
         f"TransPort 127.0.0.1:{TRANS_PORT} {ISOLATION}",
         f"DNSPort 127.0.0.1:{DNS_PORT}",
     ]
-    if ipv6:
+    if loopback_v6:
         # Without these, ip6tables REDIRECT would hand every IPv6 connection to
-        # [::1]:TRANS_PORT, where a v4-only tor is not listening.
+        # [::1]:TRANS_PORT, where a v4-only tor is not listening. When lo has no
+        # ::1 they are omitted (tor would fail to bind); the IPv6 rules are still
+        # installed, and their REDIRECT to the absent ::1 fails closed.
         listeners += [
             f"TransPort [::1]:{TRANS_PORT} {ISOLATION}",
             f"DNSPort [::1]:{DNS_PORT}",
@@ -369,13 +412,27 @@ def prepare_data_dir(user: str) -> None:
     a plain chown is not recursive, so a directory left over from an earlier run
     (or from a distro that used a different tor user) would keep permissions tor
     cannot use and would fail to start with its log unwritable.
+
+    The tor user owns everything in here, so any entry may be a symlink it
+    planted (to /etc/shadow, say), and root following it would hand the target
+    to tor. fwalk never descends into a symlinked directory, re-checks each
+    directory it opens against its lstat to defeat swaps mid-walk, and resolves
+    names relative to that open directory; chown never follows the final link.
     """
     entry = pwd.getpwnam(user)
     DATA_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
     DATA_DIR.chmod(0o700)
-    for path in (DATA_DIR, *DATA_DIR.rglob("*")):
-        with contextlib.suppress(OSError):
-            os.chown(path, entry.pw_uid, entry.pw_gid)
+    os.chown(DATA_DIR, entry.pw_uid, entry.pw_gid, follow_symlinks=False)
+    for _, dirs, files, dirfd in os.fwalk(DATA_DIR, follow_symlinks=False):
+        for name in (*dirs, *files):
+            with contextlib.suppress(OSError):
+                os.chown(
+                    name,
+                    entry.pw_uid,
+                    entry.pw_gid,
+                    dir_fd=dirfd,
+                    follow_symlinks=False,
+                )
 
 
 def _tor_pid() -> int | None:
@@ -478,20 +535,39 @@ def tor_check(timeout: float = 15.0) -> dict[str, Any]:
     return payload
 
 
+def report_tor_check() -> bool | None:
+    """Print the check service's verdict; None if it could not be asked."""
+    try:
+        data = tor_check()
+    except (OSError, urllib.error.URLError, ValueError, NipeError) as exc:
+        print(f"[!] Could not reach the Tor check service: {exc}")
+        return None
+    is_tor = bool(data.get("IsTor"))
+    print(f"\n[+] Status: {'true' if is_tor else 'false'}")
+    print(f"[+] Ip: {data.get('IP', 'unknown')}\n")
+    return is_tor
+
+
 def cmd_start() -> int:
     """Start the private Tor instance and route all traffic through it."""
     require_root()
     user = tor_user()
     families = _families()
 
+    # On a restart the previous rules stay up while tor is down and the data
+    # dir and torrc are rewritten: with no listener behind the redirects they
+    # fail closed, so nothing leaves in the clear during that work.
     stop_tor()
-    teardown_all()
-    prepare_data_dir(user)
-    write_torrc(user, ipv6=V6 in families)
 
     try:
-        # Rules first: a failure now leaves the host exactly as it was, and the
-        # tor user's exemption is in place before tor needs the network.
+        prepare_data_dir(user)
+        write_torrc(user, loopback_v6=loopback_has_ipv6())
+        # The only cleartext window is from this teardown to the restore below.
+        # teardown_all rather than per-family: it also drops the IPv6 chains of
+        # an earlier run when IPv6 is no longer in families.
+        teardown_all()
+        # Rules before tor: the tor user's exemption is in place before tor
+        # needs the network, and a failure here is rolled back below.
         for family in families:
             _install(family, user)
         flush_conntrack()
@@ -500,13 +576,24 @@ def cmd_start() -> int:
         print("[*] Waiting for Tor to bootstrap...")
         wait_for_bootstrap()
         flush_dns_cache()
-    except NipeError:
+    except BaseException:
         # Never leave redirects pointing at a tor that is not there, and never
-        # leave the machine unprotected after reporting a failure.
+        # leave the machine unprotected after reporting a failure. BaseException
+        # so that Ctrl-C mid-install or mid-bootstrap rolls back as well.
         stop_tor()
         teardown_all()
         raise
-    return cmd_status()
+    verdict = report_tor_check()
+    if verdict is None:
+        # Tor bootstrapped and the rules are live and fail closed, so nipe is
+        # working; only the third-party confirmation is missing.
+        print("[!] nipe is running, but routing through Tor could not be verified.")
+        return 0
+    if not verdict:
+        # Stay up regardless: tearing down would put the traffic in the clear.
+        print("[!] nipe is left running; use 'stop' to remove it.")
+        return 1
+    return 0
 
 
 def cmd_stop() -> int:
@@ -521,27 +608,13 @@ def cmd_stop() -> int:
     return 0
 
 
-def cmd_restart() -> int:
-    """Stop, then start."""
-    cmd_stop()
-    return cmd_start()
-
-
 def cmd_status() -> int:
     """Report whether traffic is currently leaving over Tor."""
     require_root()
     if _tor_pid() is None or not rules_installed():
         print("[!] nipe is not running.")
         return 1
-    try:
-        data = tor_check()
-    except (OSError, urllib.error.URLError, ValueError, NipeError) as exc:
-        print(f"[!] Could not reach the Tor check service: {exc}")
-        return 1
-    is_tor = bool(data.get("IsTor"))
-    print(f"\n[+] Status: {'true' if is_tor else 'false'}")
-    print(f"[+] Ip: {data.get('IP', 'unknown')}\n")
-    return 0 if is_tor else 1
+    return 0 if report_tor_check() else 1
 
 
 # Each entry is (probe binary, optional preparation steps, install step). The
@@ -563,7 +636,7 @@ INSTALLERS: tuple[tuple[str, tuple[list[str], ...], list[str]], ...] = (
         (["yum", "install", "-y", "epel-release"],),
         ["yum", "install", "-y", *PACKAGES],
     ),
-    ("pacman", (), ["pacman", "-Sy", "--noconfirm", *PACKAGES]),
+    ("pacman", (), ["pacman", "-Syu", "--needed", "--noconfirm", *PACKAGES]),
     ("zypper", (), ["zypper", "--non-interactive", "install", *PACKAGES]),
     ("xbps-install", (), ["xbps-install", "-Sy", *PACKAGES]),
 )
@@ -588,11 +661,15 @@ def cmd_install() -> int:
     )
 
 
+# restart is plain start: cmd_start already stops tor and swaps the rules in
+# place, keeping the old ones up until just before the new ones are restored.
+# Running stop first would only add a window in which traffic leaves in the
+# clear.
 COMMANDS = {
     "install": cmd_install,
     "start": cmd_start,
     "stop": cmd_stop,
-    "restart": cmd_restart,
+    "restart": cmd_start,
     "status": cmd_status,
 }
 
@@ -605,6 +682,9 @@ def main() -> int:
     try:
         return COMMANDS[sys.argv[1]]()
     except NipeError as exc:
+        print(f"[!] {exc}", file=sys.stderr)
+        return 1
+    except OSError as exc:
         print(f"[!] {exc}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:

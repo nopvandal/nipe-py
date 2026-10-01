@@ -22,17 +22,20 @@ rejected rather than sent in the clear.
 $ sudo ./nipe.py {install|start|stop|restart|status}
 ```
 
-| Command   | Action                                                              |
-| --------- | ------------------------------------------------------------------- |
-| `install` | Install `tor` and `iptables` via your distro's package manager.     |
-| `start`   | Start the private Tor instance and redirect all traffic through it. |
-| `stop`    | Remove the firewall rules and stop the Tor instance.                |
-| `restart` | `stop` then `start`.                                                 |
-| `status`  | Query `check.torproject.org` and report whether traffic is on Tor.  |
+| Command   | Action                                                                                  |
+| --------- | --------------------------------------------------------------------------------------- |
+| `install` | Install `tor` and `iptables` via your distro's package manager (`pacman -Syu` on Arch). |
+| `start`   | Start the private Tor instance and redirect all traffic through it.                     |
+| `stop`    | Remove the firewall rules and stop the Tor instance.                                    |
+| `restart` | Same as `start`, which already stops the old Tor and replaces the rules.                |
+| `status`  | Query `check.torproject.org` and report whether traffic is on Tor.                      |
 
 Every command exits non-zero on failure, so `sudo ./nipe.py start && ...` is
 safe to use in a script: `start` fails rather than returning while traffic is
-still in the clear.
+still in the clear. Once Tor has bootstrapped and the rules are live, `start`
+exits 0 even if `check.torproject.org` cannot be reached (it prints a warning);
+it exits non-zero if the check service reports traffic is not on Tor (nipe stays
+running, fail-closed).
 
 Example:
 
@@ -62,19 +65,33 @@ knowing about.
   host's real address, which means containers lose internet access while nipe
   is running.
 - **DNS is limited to A, AAAA and PTR.** That is all Tor's `DNSPort` answers,
-  so SRV, MX and TXT lookups fail. DNS over TCP still works: it is carried by
-  the transparent proxy rather than the resolver.
-- **IPv6 is all or nothing.** If IPv6 is enabled but `ip6tables` is missing,
-  `start` refuses to run rather than leave IPv6 unfiltered, since glibc prefers
-  AAAA and most traffic would leak.
+  so SRV, MX and TXT lookups fail. TCP DNS to public resolvers is carried by
+  the transparent proxy; TCP DNS to a LAN resolver (e.g. a home router) is
+  rejected, because a LAN resolver would forward the query upstream in the
+  clear. A loopback stub like systemd-resolved still answers, but its TCP
+  fallback to a LAN upstream fails.
+- **IPv6 is all or nothing.** If the kernel has IPv6 support at all, nipe
+  installs ip6tables rules regardless of `disable_ipv6`, because interfaces
+  can re-enable IPv6 individually (NetworkManager does) or appear later with
+  IPv6 on. If `ip6tables` is missing on such a kernel, `start` refuses to run;
+  the only way around it is installing ip6tables or booting with
+  `ipv6.disable=1`.
+- **Inbound connections from the internet get no replies.** Replies to a
+  public address are rejected like any other outbound packet, so servers on the
+  host stop answering and running `start` over SSH on a remote machine (a VPS)
+  cuts off the session. LAN peers are unaffected. Replies are not exempted
+  because after the conntrack flush, an already-open outbound connection whose
+  next packet comes from the remote is tracked as inbound, so exempting replies
+  would let it continue outside Tor.
 
 ## Portability
 
 nipe depends on:
 
 - `iptables`, `ip6tables` and `iptables-restore`.
-- `/proc/<pid>/comm` to confirm the pidfile still points at our Tor, and
-  `/proc/sys/net/ipv6/conf/all/disable_ipv6` to detect IPv6.
+- `/proc/<pid>/comm` to confirm the pidfile still points at our Tor,
+  `/proc/sys/net/ipv6` to detect IPv6 support, and `/proc/net/if_inet6` to check
+  loopback has `::1` before Tor listens on it.
 - `/run` for the generated torrc, `conntrack` for the state flush, and
   `resolvectl` or `nscd` for the DNS flush.
 - An unprivileged `debian-tor`, `toranon` or `tor` account for Tor to drop to,
